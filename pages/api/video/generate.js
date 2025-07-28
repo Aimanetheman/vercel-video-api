@@ -63,9 +63,12 @@ export default async function handler(req, res) {
       fs.writeFileSync(concatFile, concatContent);
 
       finalAudioPath = path.join(tempDir, 'combined_audio.mp3');
-      await execAsync(`ffmpeg -f concat -safe 0 -i "${concatFile}" -c copy "${finalAudioPath}"`);
+      await execAsync(`${ffmpegPath} -f concat -safe 0 -i "${concatFile}" -c copy "${finalAudioPath}"`);
       console.log('Audio concatenation completed');
     }
+    // Get FFmpeg paths
+    const ffmpegPath = await ensureFFmpeg();
+    const ffprobePath = await ensureFFprobe();
 
     // Get audio duration
     console.log('Getting audio duration...');
@@ -82,7 +85,7 @@ export default async function handler(req, res) {
     const outputPath = path.join(tempDir, 'output.mp4');
     
     const ffmpegCmd = [
-      'ffmpeg',
+      'ffmpegPath',
       '-loop 1',
       `-i "${imagePath}"`,
       `-i "${finalAudioPath}"`,
