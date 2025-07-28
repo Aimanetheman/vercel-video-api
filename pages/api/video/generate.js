@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { ensureFFmpeg, ensureFFprobe } from '../../../lib/ffmpeg.js';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
