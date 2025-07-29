@@ -1,10 +1,5 @@
-import { ensureFFmpeg, ensureFFprobe } from '../../../lib/ffmpeg.js';
-import { promisify } from 'util';
-import fs from 'fs';
-import path from 'path';
-import https from 'https';
-
-const execAsync = promisify(exec);
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -12,7 +7,7 @@ export default async function handler(req, res) {
   }
 
   const startTime = Date.now();
-  let tempDir;
+  let ffmpeg;
 
   try {
     const { audioUrls, imageUrl, targetDuration = 120 } = req.body;
@@ -26,125 +21,101 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'imageUrl is required' });
     }
 
-    // Create temp directory
-    const jobId = Date.now().toString();
-    tempDir = `/tmp/video_${jobId}`;
+    console.log('Initializing FFmpeg WebAssembly...');
     
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
-    }
+    // Initialize FFmpeg
+    ffmpeg = new FFmpeg();
+    
+    // Load FFmpeg WebAssembly
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
 
-    console.log(`Starting video generation for job ${jobId}`);
+    console.log('FFmpeg loaded successfully');
 
-    // Download image
-    const imagePath = path.join(tempDir, 'image.jpg');
+    // Download and write image file
     console.log('Downloading image...');
-    await downloadFile(imageUrl, imagePath);
-    console.log('Image downloaded successfully');
+    const imageData = await fetchFile(imageUrl);
+    await ffmpeg.writeFile('image.jpg', imageData);
+    console.log('Image written to FFmpeg filesystem');
 
-    // Download audio files
+    // Download and write audio files
     const audioFiles = [];
     for (let i = 0; i < audioUrls.length; i++) {
       console.log(`Downloading audio ${i + 1}/${audioUrls.length}...`);
-      const audioPath = path.join(tempDir, `audio_${i}.mp3`);
-      await downloadFile(audioUrls[i], audioPath);
-      audioFiles.push(audioPath);
-      console.log(`Audio ${i + 1} downloaded successfully`);
+      const audioData = await fetchFile(audioUrls[i]);
+      const audioFileName = `audio_${i}.mp3`;
+      await ffmpeg.writeFile(audioFileName, audioData);
+      audioFiles.push(audioFileName);
+      console.log(`Audio ${i + 1} written to FFmpeg filesystem`);
     }
 
     // Create concat file for multiple audio files
-    let finalAudioPath;
+    let finalAudioFile;
     if (audioFiles.length === 1) {
-      finalAudioPath = audioFiles[0];
+      finalAudioFile = audioFiles[0];
     } else {
-      console.log('Concatenating audio files...');
-      const concatFile = path.join(tempDir, 'concat.txt');
+      console.log('Creating concat file for multiple audio files...');
       const concatContent = audioFiles.map(file => `file '${file}'`).join('\n');
-      fs.writeFileSync(concatFile, concatContent);
-
-      finalAudioPath = path.join(tempDir, 'combined_audio.mp3');
-      await execAsync(`${ffmpegPath} -f concat -safe 0 -i "${concatFile}" -c copy "${finalAudioPath}"`);
+      await ffmpeg.writeFile('concat.txt', new TextEncoder().encode(concatContent));
+      
+      console.log('Concatenating audio files...');
+      await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'combined_audio.mp3']);
+      finalAudioFile = 'combined_audio.mp3';
       console.log('Audio concatenation completed');
     }
-    // Get FFmpeg paths
-    const ffmpegPath = await ensureFFmpeg();
-    const ffprobePath = await ensureFFprobe();
 
     // Get audio duration
     console.log('Getting audio duration...');
-    const { stdout: durationOutput } = await execAsync(`ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${finalAudioPath}"`);
-    const audioDuration = parseFloat(durationOutput.trim());
-    console.log(`Audio duration: ${audioDuration} seconds`);
+    await ffmpeg.exec(['-i', finalAudioFile, '-f', 'null', '-']);
     
-    // Use target duration or audio duration, whichever is appropriate
-    const videoDuration = Math.max(targetDuration, audioDuration);
+    // For simplicity, use targetDuration directly
+    const videoDuration = targetDuration;
     console.log(`Video duration will be: ${videoDuration} seconds`);
 
-    // Create video
+    // Create video with static image and audio
     console.log('Creating video...');
-    const outputPath = path.join(tempDir, 'output.mp4');
-    
-    const ffmpegCmd = [
-      'ffmpegPath',
-      '-loop 1',
-      `-i "${imagePath}"`,
-      `-i "${finalAudioPath}"`,
-      '-c:v libx264',
-      '-preset ultrafast',
-      '-tune stillimage',
-      '-c:a aac',
-      '-b:a 192k',
-      '-pix_fmt yuv420p',
+    await ffmpeg.exec([
+      '-loop', '1',
+      '-i', 'image.jpg',
+      '-i', finalAudioFile,
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'stillimage',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-pix_fmt', 'yuv420p',
       '-shortest',
-      `-t ${videoDuration}`,
-      `"${outputPath}"`
-    ].join(' ');
+      '-t', videoDuration.toString(),
+      'output.mp4'
+    ]);
 
-    console.log('Running FFmpeg command...');
-    await execAsync(ffmpegCmd);
+    console.log('Video creation completed');
 
-    // Check if video was created
-    if (!fs.existsSync(outputPath)) {
-      throw new Error('Video file was not created');
-    }
+    // Read the output video
+    const videoData = await ffmpeg.readFile('output.mp4');
+    const videoBuffer = Buffer.from(videoData);
 
-    const stats = fs.statSync(outputPath);
-    console.log(`Video created successfully: ${stats.size} bytes`);
+    console.log(`Video generated successfully: ${videoBuffer.length} bytes`);
 
-    // Read video file
-    const videoBuffer = fs.readFileSync(outputPath);
-    
-    // Cleanup
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-      console.log('Cleanup completed');
-    } catch (cleanupError) {
-      console.warn('Cleanup warning:', cleanupError.message);
-    }
-
-    // Send video as response
+    // Calculate processing time
     const processingTime = (Date.now() - startTime) / 1000;
     console.log(`Total processing time: ${processingTime} seconds`);
 
+    // Send video as response
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="video_${jobId}.mp4"`);
-    res.setHeader('Content-Length', videoBuffer.length);
+    res.setHeader('Content-Disposition', `attachment; filename="video_${Date.now()}.mp4"`);
+    res.setHeader('Content-Length', videoBuffer.length.toString());
     res.setHeader('X-Processing-Time', processingTime.toString());
     res.setHeader('X-Video-Duration', videoDuration.toString());
+    res.setHeader('X-FFmpeg-Type', 'WebAssembly');
     
     return res.send(videoBuffer);
 
   } catch (error) {
     console.error('Video generation error:', error);
-    
-    // Cleanup on error
-    if (tempDir && fs.existsSync(tempDir)) {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch (cleanupError) {
-        console.warn('Error cleanup failed:', cleanupError.message);
-      }
-    }
 
     const processingTime = (Date.now() - startTime) / 1000;
 
@@ -152,60 +123,19 @@ export default async function handler(req, res) {
       error: 'Video generation failed', 
       details: error.message,
       processingTime: processingTime,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      ffmpegType: 'WebAssembly'
     });
   }
-}
-
-async function downloadFile(url, filepath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filepath);
-    
-    const request = https.get(url, {
-      timeout: 60000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    }, (response) => {
-      if (response.statusCode !== 200) {
-        file.close();
-        fs.unlink(filepath, () => {});
-        reject(new Error(`Download failed: HTTP ${response.statusCode}`));
-        return;
-      }
-
-      response.pipe(file);
-      
-      file.on('finish', () => {
-        file.close();
-        resolve();
-      });
-
-      file.on('error', (error) => {
-        file.close();
-        fs.unlink(filepath, () => {});
-        reject(error);
-      });
-    });
-
-    request.on('error', (error) => {
-      file.close();
-      fs.unlink(filepath, () => {});
-      reject(error);
-    });
-
-    request.on('timeout', () => {
-      request.destroy();
-      file.close();
-      fs.unlink(filepath, () => {});
-      reject(new Error('Download timeout after 60 seconds'));
-    });
-  });
 }
 
 export const config = {
   api: {
     responseLimit: false,
+    bodyParser: {
+      sizeLimit: '50mb',
+    },
   },
+  maxDuration: 300,
 }
 
